@@ -46,12 +46,72 @@ debug: build
 		-serial stdio \
 		-s -S
 
+# 构建Rust内核版本
+rust-kernel: bootloader kernel
+	@echo "创建Rust内核版本磁盘镜像..."
+	# 将ELF格式的简单Rust内核转换为纯二进制
+	rust-objcopy --binary-architecture=x86_64 target/x86_64-unknown-none/debug/simple-kernel --strip-all -O binary kernel.bin
+	# 创建1.44MB软盘镜像
+	dd if=/dev/zero of=jingos_rust.img bs=1024 count=1440
+	# 写入Stage1到第一个扇区
+	dd if=bootloader/stage1.bin of=jingos_rust.img bs=512 count=1 conv=notrunc
+	# 写入Rust内核Stage2到第二个扇区开始
+	cd bootloader && nasm -f bin src/rust_simple.s -o rust_stage2.bin
+	dd if=bootloader/rust_stage2.bin of=jingos_rust.img bs=512 seek=1 conv=notrunc
+	# 写入转换后的Rust内核二进制到第10个扇区开始
+	dd if=kernel.bin of=jingos_rust.img bs=512 seek=10 conv=notrunc
+
+# 运行Rust内核版本
+run-rust: rust-kernel
+	@echo "启动 JingOS Rust 内核版本..."
+	qemu-system-x86_64 \
+		-drive format=raw,file=jingos_rust.img \
+		-serial stdio
+
+# 构建C内核版本
+c-kernel: bootloader
+	@echo "构建 C 风格内核..."
+	cd bootloader && nasm -f bin src/c_kernel.s -o c_kernel.bin
+	@echo "创建C内核版本磁盘镜像..."
+	# 创建1.44MB软盘镜像
+	dd if=/dev/zero of=jingos_c.img bs=1024 count=1440
+	# 写入Stage1到第一个扇区
+	dd if=bootloader/stage1.bin of=jingos_c.img bs=512 count=1 conv=notrunc
+	# 写入C内核Stage2到第二个扇区开始
+	cd bootloader && nasm -f bin src/rust_simple.s -o c_stage2.bin
+	dd if=bootloader/c_stage2.bin of=jingos_c.img bs=512 seek=1 conv=notrunc
+	# 写入C风格内核到第10个扇区开始
+	dd if=bootloader/c_kernel.bin of=jingos_c.img bs=512 seek=10 conv=notrunc
+
+# 运行C内核版本
+run-c: c-kernel
+	@echo "启动 JingOS C 内核版本..."
+	qemu-system-x86_64 \
+		-drive format=raw,file=jingos_c.img \
+		-serial stdio
+
+# 显示所有可用的版本
+versions:
+	@echo "🎉 JingOS - 可用的版本："
+	@echo ""
+	@echo "1. 📱 原始测试版本:"
+	@echo "   make run          # 显示红色'Jing'内核标识"
+	@echo ""
+	@echo "2. 🔧 简单内核版本:"
+	@echo "   make run-rust     # 显示黄色'KERN'测试"
+	@echo ""
+	@echo "3. 🎨 C风格内核版本:"
+	@echo "   make run-c        # 完整的彩色C内核界面"
+	@echo ""
+	@echo "✅ 所有版本都支持完整的64位长模式启动！"
+
 # 清理
 clean:
 	@echo "清理构建文件..."
 	cargo clean
-	rm -f jingos.img
-	rm -f bootloader/bootloader.bin
+	rm -f *.img
+	rm -f bootloader/*.bin
+	cd c_kernel && make clean 2>/dev/null || true
 
 # 帮助
 help:
