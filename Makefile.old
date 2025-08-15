@@ -1,0 +1,79 @@
+# JingOS Makefile with Custom Bootloader
+
+# 默认目标
+.PHONY: all build run debug clean test help bootloader kernel
+
+# 默认构建
+all: build
+
+# 构建自定义bootloader
+bootloader:
+	@echo "构建自定义 Bootloader..."
+	cd bootloader && nasm -f bin src/step64_boot.s -o bootloader.bin
+
+# 构建内核
+kernel:
+	@echo "构建 JingOS 内核..."
+	cargo build --target x86_64-unknown-none --package jing-kernel
+
+# 创建完整的磁盘镜像
+build: bootloader kernel
+	@echo "创建磁盘镜像..."
+	# 创建1.44MB软盘镜像
+	dd if=/dev/zero of=jingos.img bs=1024 count=1440
+	# 写入bootloader到第一个扇区
+	dd if=bootloader/bootloader.bin of=jingos.img bs=512 count=1 conv=notrunc
+	# 写入内核到0x10000地址 (扇区32开始)
+	dd if=target/x86_64-unknown-none/debug/kernel of=jingos.img bs=512 seek=32 conv=notrunc
+
+# 在QEMU中运行
+run: build
+	@echo "在 QEMU 中启动 JingOS..."
+	qemu-system-x86_64 \
+		-drive format=raw,file=jingos.img \
+		-serial stdio
+
+# 调试模式运行
+debug: build
+	@echo "调试模式启动 JingOS..."
+	qemu-system-x86_64 \
+		-drive format=raw,file=jingos.img \
+		-serial stdio \
+		-s -S
+
+# 运行测试
+test:
+	@echo "运行内核测试..."
+	cargo test --target x86_64-unknown-none --package jing-kernel
+
+# 清理构建文件
+clean:
+	@echo "清理构建文件..."
+	cargo clean
+	rm -f bootloader/boot.o bootloader/bootloader.bin jingos.img
+
+# 检查代码格式
+fmt:
+	@echo "格式化代码..."
+	cargo fmt
+
+# 代码检查
+clippy:
+	@echo "运行 Clippy 检查..."
+	cargo clippy --target x86_64-unknown-none --package jing-kernel
+
+# 显示帮助
+help:
+	@echo "JingOS 构建系统 (自定义 Bootloader)"
+	@echo ""
+	@echo "可用命令:"
+	@echo "  bootloader   - 构建自定义bootloader"
+	@echo "  kernel       - 构建内核"
+	@echo "  build        - 构建完整系统"
+	@echo "  run          - 在QEMU中运行"
+	@echo "  debug        - 调试模式运行"
+	@echo "  test         - 运行测试"
+	@echo "  clean        - 清理构建文件"
+	@echo "  fmt          - 格式化代码"
+	@echo "  clippy       - 代码检查"
+	@echo "  help         - 显示此帮助"

@@ -1,0 +1,23 @@
+[workspace]
+members = ["kernel", "bootloader"]
+resolver = "2"
+
+[workspace.dependencies]
+# 共享依赖版本管理
+volatile = "0.2.6"
+spin = "0.5"
+x86_64 = "0.14"
+uart_16550 = "0.2"
+pic8259 = "0.10"
+pc-keyboard = "0.5"
+linked_list_allocator = "0.9"
+
+[profile.dev]
+# 开发模式优化
+panic = "abort"
+
+[profile.release]
+# 发布模式优化
+panic = "abort"
+lto = true
+codegen-units = 1

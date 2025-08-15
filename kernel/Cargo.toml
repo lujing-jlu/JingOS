@@ -1,0 +1,37 @@
+[package]
+name = "jing-kernel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# bootloader = { version = "0.9", features = ["map_physical_memory"] }
+volatile = { workspace = true }
+spin = { workspace = true }
+x86_64 = { workspace = true }
+uart_16550 = { workspace = true }
+pic8259 = { workspace = true }
+pc-keyboard = { workspace = true }
+linked_list_allocator = { workspace = true }
+
+[dependencies.lazy_static]
+version = "1.0"
+features = ["spin_no_std"]
+
+# 目标配置
+[package.metadata.bootimage]
+test-args = [
+    "-device",
+    "isa-debug-exit,iobase=0xf4,iosize=0x04",
+    "-serial",
+    "stdio",
+    "-display",
+    "none",
+]
+test-success-exit-code = 33
+
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+test = false
+bench = false
