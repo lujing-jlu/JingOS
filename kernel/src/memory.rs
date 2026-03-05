@@ -1,4 +1,5 @@
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
+use spin::Mutex;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageSize, PageTable, PageTableFlags, PhysFrame,
@@ -18,6 +19,16 @@ pub struct MemorySummary {
     pub reserved_bytes: u64,
     pub largest_usable_region_bytes: u64,
     pub usable_frames_4k: usize,
+}
+
+static KERNEL_MEMORY_SUMMARY: Mutex<Option<MemorySummary>> = Mutex::new(None);
+
+pub fn set_kernel_memory_summary(summary: MemorySummary) {
+    *KERNEL_MEMORY_SUMMARY.lock() = Some(summary);
+}
+
+pub fn kernel_memory_summary() -> Option<MemorySummary> {
+    *KERNEL_MEMORY_SUMMARY.lock()
 }
 
 pub fn summarize_memory(regions: &MemoryRegions) -> MemorySummary {
@@ -213,9 +224,7 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     }
 }
 
-pub unsafe fn init_offset_page_table(
-    physical_memory_offset: VirtAddr,
-) -> OffsetPageTable<'static> {
+pub unsafe fn init_offset_page_table(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
     let level_4_table = unsafe { active_level_4_table(physical_memory_offset) };
     unsafe { OffsetPageTable::new(level_4_table, physical_memory_offset) }
 }
@@ -246,10 +255,28 @@ pub fn map_demo_page(
     Ok(value)
 }
 
-pub fn translate_virtual_address(
-    physical_memory_offset: u64,
+pub fn map_page_with_flags(
+    mapper: &mut OffsetPageTable<'static>,
+    frame_allocator: &mut BootInfoFrameAllocator,
     virtual_address: u64,
-) -> Option<u64> {
+    flags: PageTableFlags,
+) -> Result<(), &'static str> {
+    let page: Page<Size4KiB> = Page::containing_address(VirtAddr::new(virtual_address));
+
+    if mapper.translate_addr(page.start_address()).is_some() {
+        return Err("page already mapped");
+    }
+
+    let frame = frame_allocator
+        .allocate_frame()
+        .ok_or("no free frame for page mapping")?;
+    let mapping = unsafe { mapper.map_to(page, frame, flags, frame_allocator) }
+        .map_err(|_| "map_to failed")?;
+    mapping.flush();
+    Ok(())
+}
+
+pub fn translate_virtual_address(physical_memory_offset: u64, virtual_address: u64) -> Option<u64> {
     let mapper = unsafe { init_offset_page_table(VirtAddr::new(physical_memory_offset)) };
     mapper
         .translate_addr(VirtAddr::new(virtual_address))

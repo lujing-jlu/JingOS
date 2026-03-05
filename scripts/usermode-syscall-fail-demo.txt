@@ -1,0 +1,6 @@
+# verify ring3 syscall/sysret error-path status contract
+sysabi
+usermode_syscall_fail
+sleep_s 2
+status
+exit

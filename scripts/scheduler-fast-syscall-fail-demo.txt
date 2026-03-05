@@ -1,0 +1,9 @@
+# verify scheduler can drive one fast syscall error-path ring3 demo
+sysabi
+tasknew fastsyscall_fail
+taskstep
+sleep_s 1
+taskstep
+sleep_s 2
+status
+exit

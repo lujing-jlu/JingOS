@@ -1,0 +1,11 @@
+# verify scheduler can drive fast syscall success+error tasks in one boot
+tasknew fastsyscall
+tasknew fastsyscall_fail
+taskstep
+sleep_s 1
+taskstep
+sleep_s 1
+taskstep
+sleep_s 1
+status
+exit

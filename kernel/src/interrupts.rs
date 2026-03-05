@@ -1,10 +1,13 @@
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::arch::global_asm;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use pic8259::ChainedPics;
 use spin::{Lazy, Mutex};
-use x86_64::registers::control::Cr2;
 use x86_64::instructions::port::Port;
+use x86_64::registers::control::Cr2;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::{PrivilegeLevel, VirtAddr};
 
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -15,12 +18,199 @@ const PIT_MAX_HZ: u32 = PIT_INPUT_HZ;
 const PIT_COMMAND_PORT: u16 = 0x43;
 const PIT_CHANNEL0_PORT: u16 = 0x40;
 
+unsafe extern "C" {
+    fn jingos_syscall_interrupt_entry();
+    fn jingos_fast_syscall_entry();
+    fn jingos_usermode_exit_interrupt_entry();
+}
+
+global_asm!(
+    r#"
+.global jingos_syscall_interrupt_entry
+.type jingos_syscall_interrupt_entry,@function
+jingos_syscall_interrupt_entry:
+    push r15
+    push r14
+    push r13
+    push r12
+    push r11
+    push r10
+    push r9
+    push r8
+    push rbp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push rbx
+    push rax
+
+    mov rdi, rsp
+    call {dispatch}
+
+    pop rax
+    pop rbx
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rbp
+    pop r8
+    pop r9
+    pop r10
+    pop r11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
+    iretq
+"#,
+    dispatch = sym syscall_interrupt_dispatch_bridge,
+);
+
+global_asm!(
+    r#"
+.global jingos_usermode_exit_interrupt_entry
+.type jingos_usermode_exit_interrupt_entry,@function
+jingos_usermode_exit_interrupt_entry:
+    push r15
+    push r14
+    push r13
+    push r12
+    push r11
+    push r10
+    push r9
+    push r8
+    push rbp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push rbx
+    push rax
+
+    mov rdi, rsp
+    call {dispatch}
+
+    pop rax
+    pop rbx
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rbp
+    pop r8
+    pop r9
+    pop r10
+    pop r11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
+    iretq
+"#,
+    dispatch = sym usermode_exit_interrupt_dispatch_bridge,
+);
+
+global_asm!(
+    r#"
+.global jingos_fast_syscall_entry
+.type jingos_fast_syscall_entry,@function
+jingos_fast_syscall_entry:
+    swapgs
+    mov qword ptr gs:[8], rsp
+    mov rsp, qword ptr gs:[0]
+
+    push r11
+    push rcx
+
+    push r15
+    push r14
+    push r13
+    push r12
+    push r11
+    push r10
+    push r9
+    push r8
+    push rbp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push rbx
+    push rax
+
+    sub rsp, 8
+    lea rdi, [rsp + 8]
+    call {dispatch}
+    add rsp, 8
+
+    pop rax
+    pop rbx
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rbp
+    pop r8
+    pop r9
+    pop r10
+    pop r11
+    pop r12
+    pop r13
+    pop r14
+    pop r15
+
+    mov r10, rcx
+
+    pop rcx
+    pop r11
+
+    mov rsp, qword ptr gs:[8]
+    swapgs
+    sysretq
+"#,
+    dispatch = sym syscall_interrupt_dispatch_bridge,
+);
+
+extern "C" fn syscall_interrupt_dispatch_bridge(registers: *mut crate::syscall::SyscallRegisters) {
+    let registers = unsafe { &mut *registers };
+    crate::syscall::handle_interrupt_from_registers(registers);
+}
+
+extern "C" fn usermode_exit_interrupt_dispatch_bridge(
+    registers: *mut crate::syscall::SyscallRegisters,
+) {
+    let registers = unsafe { &mut *registers };
+    crate::usermode::handle_exit_interrupt_from_registers(registers);
+}
+
+pub fn fast_syscall_entry_address() -> VirtAddr {
+    VirtAddr::from_ptr(jingos_fast_syscall_entry as *const ())
+}
+
 static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut table = InterruptDescriptorTable::new();
     table.breakpoint.set_handler_fn(breakpoint_handler);
     table.page_fault.set_handler_fn(page_fault_handler);
     table[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
     table[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
+
+    unsafe {
+        table[crate::syscall::SYSCALL_INTERRUPT_VECTOR]
+            .set_handler_addr(VirtAddr::from_ptr(
+                jingos_syscall_interrupt_entry as *const (),
+            ))
+            .set_privilege_level(PrivilegeLevel::Ring3);
+    }
+
+    unsafe {
+        table[crate::usermode::USERMODE_EXIT_INTERRUPT_VECTOR]
+            .set_handler_addr(VirtAddr::from_ptr(
+                jingos_usermode_exit_interrupt_entry as *const (),
+            ))
+            .set_privilege_level(PrivilegeLevel::Ring3);
+    }
     table
 });
 
@@ -52,6 +242,15 @@ impl ScancodeBuffer {
     }
 
     fn push(&mut self, scancode: u8) {
+        if self.write_index >= SCANCODE_BUFFER_SIZE
+            || self.read_index >= SCANCODE_BUFFER_SIZE
+            || self.len > SCANCODE_BUFFER_SIZE
+        {
+            self.write_index %= SCANCODE_BUFFER_SIZE;
+            self.read_index %= SCANCODE_BUFFER_SIZE;
+            self.len = self.len.min(SCANCODE_BUFFER_SIZE);
+        }
+
         if self.len == SCANCODE_BUFFER_SIZE {
             self.dropped += 1;
             return;
@@ -63,6 +262,15 @@ impl ScancodeBuffer {
     }
 
     fn pop(&mut self) -> Option<u8> {
+        if self.write_index >= SCANCODE_BUFFER_SIZE
+            || self.read_index >= SCANCODE_BUFFER_SIZE
+            || self.len > SCANCODE_BUFFER_SIZE
+        {
+            self.write_index %= SCANCODE_BUFFER_SIZE;
+            self.read_index %= SCANCODE_BUFFER_SIZE;
+            self.len = self.len.min(SCANCODE_BUFFER_SIZE);
+        }
+
         if self.len == 0 {
             return None;
         }
@@ -110,7 +318,8 @@ pub fn pop_scancode() -> Option<u8> {
 
 pub fn keyboard_counters() -> (u64, u64) {
     let count = KEYBOARD_IRQS.load(Ordering::Relaxed);
-    let dropped = x86_64::instructions::interrupts::without_interrupts(|| SCANCODE_BUFFER.lock().dropped);
+    let dropped =
+        x86_64::instructions::interrupts::without_interrupts(|| SCANCODE_BUFFER.lock().dropped);
     (count, dropped)
 }
 

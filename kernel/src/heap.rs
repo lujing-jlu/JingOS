@@ -1,10 +1,10 @@
 use alloc::{boxed::Box, vec::Vec};
 use linked_list_allocator::LockedHeap;
+use x86_64::VirtAddr;
 use x86_64::structures::paging::mapper::MapToError;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTableFlags, Size4KiB,
 };
-use x86_64::VirtAddr;
 
 use crate::memory::BootInfoFrameAllocator;
 

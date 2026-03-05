@@ -1,0 +1,8 @@
+# verify ring3 fast syscall can run success path and error path in one boot
+sysabi
+usermode_syscall
+sleep_s 1
+usermode_syscall_fail
+sleep_s 1
+status
+exit

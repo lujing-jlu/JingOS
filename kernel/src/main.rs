@@ -11,14 +11,21 @@ use bootloader_api::{BootInfo, entry_point};
 use core::alloc::Layout;
 use core::fmt::Write;
 use keyboard::{KeyEvent, KeyboardDecoder};
-use x86_64::structures::paging::FrameAllocator;
+use spin::Mutex;
 use x86_64::VirtAddr;
+use x86_64::instructions::port::Port;
+use x86_64::structures::paging::FrameAllocator;
 
 mod framebuffer;
+mod gdt;
 mod heap;
 mod interrupts;
 mod keyboard;
 mod memory;
+mod syscall;
+mod task;
+mod user_program;
+mod usermode;
 
 const BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -72,13 +79,87 @@ pub fn serial_port() -> uart_16550::SerialPort {
 
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
+#[derive(Clone, Copy)]
+struct MonitorContext {
+    memory_regions: &'static MemoryRegions,
+    memory_summary: memory::MemorySummary,
+    physical_memory_offset: Option<u64>,
+}
+
+static MONITOR_CONTEXT: Mutex<Option<MonitorContext>> = Mutex::new(None);
+
+fn set_monitor_context(
+    memory_regions: &'static MemoryRegions,
+    memory_summary: memory::MemorySummary,
+    physical_memory_offset: Option<u64>,
+) {
+    let mut context = MONITOR_CONTEXT.lock();
+    *context = Some(MonitorContext {
+        memory_regions,
+        memory_summary,
+        physical_memory_offset,
+    });
+}
+
+pub fn resume_monitor_after_usermode_exit() -> ! {
+    let context = match *MONITOR_CONTEXT.lock() {
+        Some(context) => context,
+        None => {
+            let mut port = serial_port();
+            let _ = writeln!(
+                port,
+                "usermode exit requested, but monitor context is missing"
+            );
+            exit_qemu(QemuExitCode::Failed);
+        }
+    };
+
+    let mut port = serial_port();
+    console_println!(port, "returned from ring3 via int 0x81; resuming monitor");
+
+    if let Some(report) = usermode::take_last_fast_syscall_report() {
+        if report.passed() {
+            console_println!(
+                port,
+                "fast-syscall report ({}): ok call0={} (status={}) call1={} (status={})",
+                report.kind_name(),
+                report.call0_value,
+                report.call0_status,
+                report.call1_value,
+                report.call1_status
+            );
+        } else {
+            console_println!(
+                port,
+                "fast-syscall report ({}): unexpected call0={} (status={}) call1={} (status={})",
+                report.kind_name(),
+                report.call0_value,
+                report.call0_status,
+                report.call1_value,
+                report.call1_status
+            );
+            console_println!(port, "fast-syscall expected: {}", report.expected_summary());
+        }
+    }
+
+    x86_64::instructions::interrupts::enable();
+    input_loop(
+        &mut port,
+        context.memory_regions,
+        context.memory_summary,
+        context.physical_memory_offset,
+    )
+}
+
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let mut port = serial_port();
     writeln!(port, "jingOS kernel started: boot info = {boot_info:?}").unwrap();
     writeln!(port, "Hello from Rust kernel!").unwrap();
 
     let memory_summary = memory::summarize_memory(&boot_info.memory_regions);
-    let mut frame_allocator = unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
+    memory::set_kernel_memory_summary(memory_summary);
+    let mut frame_allocator =
+        unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_regions) };
     let first_frames = [
         frame_allocator.allocate_frame(),
         frame_allocator.allocate_frame(),
@@ -91,7 +172,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         let heap_result = heap::init_heap(&mut mapper, &mut frame_allocator)
             .map_err(|_| "heap init mapping failed")
             .map(|()| heap::probe_allocations());
-        Some((paging_result, heap_result))
+        let usermode_result =
+            usermode::init_memory(&mut mapper, &mut frame_allocator).map_err(|error| error);
+        Some((paging_result, heap_result, usermode_result))
     } else {
         None
     };
@@ -123,10 +206,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     )
     .unwrap();
     match paging_probe {
-        Some((Ok(value), _)) => {
+        Some((Ok(value), _, _)) => {
             writeln!(port, "Paging probe: demo page mapped, value={value:#x}").unwrap();
         }
-        Some((Err(error), _)) => {
+        Some((Err(error), _, _)) => {
             writeln!(port, "Paging probe failed: {error}").unwrap();
         }
         None => {
@@ -134,18 +217,33 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     }
     match paging_probe {
-        Some((_, Ok((boxed_value, vector_sum)))) => {
+        Some((_, Ok((boxed_value, vector_sum)), _)) => {
             writeln!(
                 port,
                 "Heap probe: Box={boxed_value:#x}, Vec sum={vector_sum}"
             )
             .unwrap();
         }
-        Some((_, Err(error))) => {
+        Some((_, Err(error), _)) => {
             writeln!(port, "Heap probe failed: {error}").unwrap();
         }
         None => {
             writeln!(port, "Heap probe skipped: no physical memory mapping").unwrap();
+        }
+    }
+    match paging_probe {
+        Some((_, _, Ok(()))) => {
+            writeln!(port, "User mode memory initialized").unwrap();
+        }
+        Some((_, _, Err(error))) => {
+            writeln!(port, "User mode memory init failed: {error}").unwrap();
+        }
+        None => {
+            writeln!(
+                port,
+                "User mode memory init skipped: no physical memory mapping"
+            )
+            .unwrap();
         }
     }
 
@@ -161,33 +259,49 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         );
         println!(
             "Frames: usable={} allocated={} remaining~={} first={first_frames:?}",
-            memory_summary.usable_frames_4k,
-            allocated_frames,
-            remaining_frames
+            memory_summary.usable_frames_4k, allocated_frames, remaining_frames
         );
-        println!(
-            "Phys mem offset = {:?}",
-            physical_memory_offset
-        );
+        println!("Phys mem offset = {:?}", physical_memory_offset);
         match paging_probe {
-            Some((Ok(value), _)) => println!("Paging probe ok: demo value={value:#x}"),
-            Some((Err(error), _)) => println!("Paging probe failed: {error}"),
+            Some((Ok(value), _, _)) => println!("Paging probe ok: demo value={value:#x}"),
+            Some((Err(error), _, _)) => println!("Paging probe failed: {error}"),
             None => println!("Paging probe skipped: no physical memory mapping"),
         }
         match paging_probe {
-            Some((_, Ok((boxed_value, vector_sum)))) => {
+            Some((_, Ok((boxed_value, vector_sum)), _)) => {
                 println!("Heap probe ok: box={boxed_value:#x}, vec_sum={vector_sum}");
             }
-            Some((_, Err(error))) => println!("Heap probe failed: {error}"),
+            Some((_, Err(error), _)) => println!("Heap probe failed: {error}"),
             None => println!("Heap probe skipped: no physical memory mapping"),
+        }
+        match paging_probe {
+            Some((_, _, Ok(()))) => println!("User mode memory initialized"),
+            Some((_, _, Err(error))) => println!("User mode memory init failed: {error}"),
+            None => println!("User mode memory init skipped: no physical memory mapping"),
         }
     }
 
     println!("jingOS kernel started");
     println!("Hello from Rust kernel!");
+    gdt::init();
+    println!("GDT + TSS initialized");
+    syscall::init_fast_syscall_scaffold(gdt::selectors());
+    let fast_syscall_status = syscall::fast_syscall_status();
+    println!(
+        "fast syscall scaffold: stage={} cpu_support={} sce_enabled={}",
+        syscall::fast_syscall_stage_name(fast_syscall_status.stage),
+        fast_syscall_status.cpu_support,
+        fast_syscall_status.sce_enabled
+    );
     println!("Initializing IDT + PIC + PIT...");
 
     interrupts::init();
+    task::init();
+    set_monitor_context(
+        &boot_info.memory_regions,
+        memory_summary,
+        physical_memory_offset,
+    );
     println!("IRQ0(timer) and IRQ1(keyboard) enabled");
     println!("Keyboard input window started (press ESC to exit)");
 
@@ -222,10 +336,34 @@ fn wait_for_ticks(target: u64, max_spins: u64) -> Option<u64> {
     None
 }
 
+fn poll_serial_byte() -> Option<u8> {
+    unsafe {
+        let mut line_status: Port<u8> = Port::new(0x3FD);
+        if line_status.read() & 0x01 == 0 {
+            return None;
+        }
+
+        let mut data: Port<u8> = Port::new(0x3F8);
+        Some(data.read())
+    }
+}
+
+fn serial_byte_to_key_event(byte: u8) -> Option<KeyEvent> {
+    match byte {
+        b'\r' | b'\n' => Some(KeyEvent::Enter),
+        0x08 | 0x7F => Some(KeyEvent::Backspace),
+        b'\t' => Some(KeyEvent::Tab),
+        0x1B => Some(KeyEvent::Escape),
+        0x20..=0x7E => Some(KeyEvent::Char(byte as char)),
+        _ => None,
+    }
+}
+
 const INPUT_LINE_MAX: usize = 128;
 const HISTORY_CAPACITY: usize = 16;
 const MONITOR_PROMPT: &str = "jingos> ";
-const COMMAND_NAMES: [&str; 16] = [
+const MONITOR_READY_MARKER: &str = "[[JINGOS_MONITOR_READY]]";
+const COMMAND_NAMES: [&str; 25] = [
     "help",
     "status",
     "ticks",
@@ -237,6 +375,15 @@ const COMMAND_NAMES: [&str; 16] = [
     "vm",
     "vmmap",
     "fault",
+    "syscall",
+    "sysabi",
+    "tasks",
+    "tasknew",
+    "taskstep",
+    "userdemo",
+    "usermode",
+    "usermode_syscall",
+    "usermode_syscall_fail",
     "echo",
     "history",
     "clear",
@@ -646,6 +793,7 @@ fn input_loop(
     let mut overwrite_mode = false;
 
     console_println!(port);
+    console_println!(port, "{MONITOR_READY_MARKER}");
     console_println!(port, "jingos monitor ready. type 'help' for commands.");
     console_print!(port, "{MONITOR_PROMPT}");
 
@@ -657,6 +805,32 @@ fn input_loop(
                 if handle_key_event(
                     port,
                     scancode,
+                    event,
+                    &mut line,
+                    &mut history,
+                    &mut rendered_len,
+                    &mut overwrite_mode,
+                    memory_regions,
+                    memory_summary,
+                    physical_memory_offset,
+                ) {
+                    let (keyboard_irqs, dropped) = interrupts::keyboard_counters();
+                    console_println!(
+                        port,
+                        "Exiting monitor: keyboard_irqs={keyboard_irqs}, dropped={dropped}, decoded={decoded_events}"
+                    );
+                    exit_qemu(QemuExitCode::Success);
+                }
+            }
+        }
+
+        while let Some(serial_byte) = poll_serial_byte() {
+            if let Some(event) = serial_byte_to_key_event(serial_byte) {
+                decoded_events += 1;
+                deadline = interrupts::ticks().saturating_add(INPUT_WINDOW_TICKS);
+                if handle_key_event(
+                    port,
+                    serial_byte,
                     event,
                     &mut line,
                     &mut history,
@@ -882,7 +1056,7 @@ fn execute_command(
         "help" => {
             console_println!(
                 port,
-                "commands: help, status, ticks, uptime, irq, mem, maps [n|all], heap, vm [addr], vmmap [addr], fault [addr], echo, history, clear, exit"
+                "commands: help, status, ticks, uptime, irq, mem, maps [n|all], heap, vm [addr], vmmap [addr], fault [addr], syscall <n> [a0] [a1] [a2], sysabi, tasks, tasknew [userdemo|monitor|fastsyscall|fastsyscall_fail], taskstep, userdemo, usermode, usermode_syscall, usermode_syscall_fail, echo, history, clear, exit"
             );
         }
         "status" => {
@@ -903,7 +1077,12 @@ fn execute_command(
             let ticks = interrupts::ticks();
             let seconds = ticks / 100;
             let centiseconds = ticks % 100;
-            console_println!(port, "uptime={}s.{:02} (ticks={ticks})", seconds, centiseconds);
+            console_println!(
+                port,
+                "uptime={}s.{:02} (ticks={ticks})",
+                seconds,
+                centiseconds
+            );
         }
         "irq" => {
             let (keyboard_irqs, dropped) = interrupts::keyboard_counters();
@@ -976,7 +1155,10 @@ fn execute_command(
         }
         "heap" => {
             let (boxed_value, vector_sum) = heap::probe_allocations();
-            console_println!(port, "heap_probe: box={boxed_value:#x}, vec_sum={vector_sum}");
+            console_println!(
+                port,
+                "heap_probe: box={boxed_value:#x}, vec_sum={vector_sum}"
+            );
         }
         "vm" => {
             let Some(offset) = physical_memory_offset else {
@@ -1057,6 +1239,292 @@ fn execute_command(
             );
             let pointer = fault_address as *const u64;
             let _ = unsafe { core::ptr::read_volatile(pointer) };
+        }
+        "syscall" => {
+            let Some(number_text) = parts.next() else {
+                console_println!(port, "usage: syscall <number> [arg0] [arg1] [arg2]");
+                return false;
+            };
+
+            let Some(number) = parse_u64(number_text) else {
+                console_println!(port, "invalid syscall number: {number_text}");
+                return false;
+            };
+
+            let arg0 = match parts.next() {
+                Some(text) => match parse_u64(text) {
+                    Some(value) => value,
+                    None => {
+                        console_println!(port, "invalid arg0: {text}");
+                        return false;
+                    }
+                },
+                None => 0,
+            };
+            let arg1 = match parts.next() {
+                Some(text) => match parse_u64(text) {
+                    Some(value) => value,
+                    None => {
+                        console_println!(port, "invalid arg1: {text}");
+                        return false;
+                    }
+                },
+                None => 0,
+            };
+            let arg2 = match parts.next() {
+                Some(text) => match parse_u64(text) {
+                    Some(value) => value,
+                    None => {
+                        console_println!(port, "invalid arg2: {text}");
+                        return false;
+                    }
+                },
+                None => 0,
+            };
+
+            match syscall::invoke_via_interrupt(number, arg0, arg1, arg2) {
+                Ok(value) => {
+                    console_println!(
+                        port,
+                        "syscall {}({arg0}, {arg1}, {arg2}) -> {value:#x}",
+                        syscall::syscall_name(number)
+                    );
+                }
+                Err(error) => {
+                    console_println!(port, "syscall error: {}", syscall::error_name(error));
+                }
+            }
+        }
+        "sysabi" => {
+            console_println!(
+                port,
+                "syscall ABI mode: {} (vector={}, implementation={})",
+                syscall::abi_mode_name(),
+                syscall::SYSCALL_INTERRUPT_VECTOR,
+                syscall::abi_mode_details()
+            );
+
+            console_println!(
+                port,
+                "fast syscall ABI: {}",
+                syscall::fast_abi_mode_details()
+            );
+
+            let fast = syscall::fast_syscall_status();
+            console_println!(
+                port,
+                "fast syscall scaffold: stage={} cpu_support={} sce_enabled={} note={}",
+                syscall::fast_syscall_stage_name(fast.stage),
+                fast.cpu_support,
+                fast.sce_enabled,
+                fast.note
+            );
+
+            if let Some(plan) = fast.selectors {
+                console_println!(
+                    port,
+                    "fast syscall selector plan: kernel_cs={:#x} kernel_ss={:#x} user_cs={:#x} user_ss={:#x}",
+                    plan.kernel_cs,
+                    plan.kernel_ss,
+                    plan.user_cs,
+                    plan.user_ss
+                );
+            }
+
+            if let Some(lstar) = fast.lstar {
+                console_println!(port, "fast syscall lstar plan: {lstar:#x}");
+            }
+
+            if let Some(kernel_gs_base) = fast.kernel_gs_base {
+                console_println!(port, "fast syscall kernel_gs_base: {kernel_gs_base:#x}");
+            }
+        }
+        "tasks" => {
+            let snapshot = task::snapshot();
+            console_println!(
+                port,
+                "scheduler: total={} ready={} running={} finished={} capacity={} next_id={}",
+                snapshot.total,
+                snapshot.ready,
+                snapshot.running,
+                snapshot.finished,
+                snapshot.capacity,
+                snapshot.next_id
+            );
+
+            let mut entries: [Option<task::TaskInfo>; task::MAX_TASKS] = [None; task::MAX_TASKS];
+            let count = task::list(&mut entries);
+            if count == 0 {
+                console_println!(port, "scheduler table is empty");
+            } else {
+                for entry in entries.iter().take(count).flatten() {
+                    console_println!(
+                        port,
+                        "  task id={} kind={} state={} runs={}",
+                        entry.id,
+                        task::task_kind_name(entry.kind),
+                        task::task_state_name(entry.state),
+                        entry.run_count
+                    );
+                }
+            }
+        }
+        "tasknew" => {
+            let kind_text = parts.next().unwrap_or("userdemo");
+            let Some(kind) = task::parse_task_kind(kind_text) else {
+                console_println!(
+                    port,
+                    "tasknew usage: tasknew [userdemo|monitor|fastsyscall|fastsyscall_fail] (got: {kind_text})"
+                );
+                return false;
+            };
+
+            match task::spawn(kind) {
+                Ok(id) => {
+                    console_println!(
+                        port,
+                        "task created: id={} kind={}",
+                        id,
+                        task::task_kind_name(kind)
+                    );
+                }
+                Err(error) => {
+                    console_println!(port, "tasknew failed: {error}");
+                }
+            }
+        }
+        "taskstep" => match task::step() {
+            Some(report) => {
+                console_println!(
+                    port,
+                    "taskstep: ran id={} kind={} runs={} (state reset to ready)",
+                    report.id,
+                    task::task_kind_name(report.kind),
+                    report.run_count
+                );
+
+                match report.kind {
+                    task::TaskKind::UserDemo => match user_program::run_user_demo() {
+                        Ok(result) => {
+                            console_println!(
+                                port,
+                                "  user_demo result: ticks={} uptime={}s sum={} usable_bytes={} usable_frames={}",
+                                result.ticks,
+                                result.uptime_seconds,
+                                result.sum,
+                                result.usable_bytes,
+                                result.usable_frames
+                            );
+                        }
+                        Err(error) => {
+                            console_println!(
+                                port,
+                                "  user_demo task failed: {}",
+                                syscall::error_name(error)
+                            );
+                        }
+                    },
+                    task::TaskKind::FastSyscallSuccess => {
+                        console_println!(
+                            port,
+                            "  fast_syscall_success task: entering ring3 success-path syscall demo"
+                        );
+                        match usermode::run_fast_syscall_demo() {
+                            Ok(()) => {
+                                console_println!(
+                                    port,
+                                    "  fast_syscall_success returned unexpectedly"
+                                );
+                            }
+                            Err(error) => {
+                                console_println!(
+                                    port,
+                                    "  fast_syscall_success task failed: {error}"
+                                );
+                            }
+                        }
+                    }
+                    task::TaskKind::FastSyscallError => {
+                        console_println!(
+                            port,
+                            "  fast_syscall_error task: entering ring3 error-path syscall demo"
+                        );
+                        match usermode::run_fast_syscall_error_demo() {
+                            Ok(()) => {
+                                console_println!(
+                                    port,
+                                    "  fast_syscall_error returned unexpectedly"
+                                );
+                            }
+                            Err(error) => {
+                                console_println!(port, "  fast_syscall_error task failed: {error}");
+                            }
+                        }
+                    }
+                    task::TaskKind::KernelMonitor => {}
+                }
+            }
+            None => {
+                console_println!(port, "taskstep: no ready task");
+            }
+        },
+        "userdemo" => match user_program::run_user_demo() {
+            Ok(report) => {
+                console_println!(
+                    port,
+                    "userdemo: ticks={} uptime={}s sum={} usable_bytes={} usable_frames={}",
+                    report.ticks,
+                    report.uptime_seconds,
+                    report.sum,
+                    report.usable_bytes,
+                    report.usable_frames
+                );
+            }
+            Err(error) => {
+                console_println!(port, "userdemo failed: {}", syscall::error_name(error));
+            }
+        },
+        "usermode" => {
+            console_println!(
+                port,
+                "launching ring3 demo (expects int 0x80 then int 0x81 return)..."
+            );
+            match usermode::run_demo() {
+                Ok(()) => {
+                    console_println!(port, "usermode returned unexpectedly");
+                }
+                Err(error) => {
+                    console_println!(port, "usermode failed: {error}");
+                }
+            }
+        }
+        "usermode_syscall" => {
+            console_println!(
+                port,
+                "launching ring3 fast-syscall demo (success path: rax(value)/r10(status), then int 0x81 return)..."
+            );
+            match usermode::run_fast_syscall_demo() {
+                Ok(()) => {
+                    console_println!(port, "usermode_syscall returned unexpectedly");
+                }
+                Err(error) => {
+                    console_println!(port, "usermode_syscall failed: {error}");
+                }
+            }
+        }
+        "usermode_syscall_fail" => {
+            console_println!(
+                port,
+                "launching ring3 fast-syscall demo (error path: unknown/overflow statuses), then int 0x81 return..."
+            );
+            match usermode::run_fast_syscall_error_demo() {
+                Ok(()) => {
+                    console_println!(port, "usermode_syscall_fail returned unexpectedly");
+                }
+                Err(error) => {
+                    console_println!(port, "usermode_syscall_fail failed: {error}");
+                }
+            }
         }
         "echo" => {
             let text = command_line.strip_prefix("echo").unwrap_or("").trim_start();

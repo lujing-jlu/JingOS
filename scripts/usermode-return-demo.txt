@@ -1,0 +1,6 @@
+# verify ring3 returns to monitor
+status # before usermode
+usermode
+sleep_s 2 # wait for ring3 demo to trigger int 0x81
+status # after usermode return
+exit

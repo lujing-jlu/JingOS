@@ -1,0 +1,5 @@
+help
+status
+sysabi
+userdemo
+exit

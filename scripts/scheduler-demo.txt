@@ -1,0 +1,7 @@
+tasks
+tasknew userdemo
+tasknew monitor
+tasks
+taskstep
+taskstep
+exit

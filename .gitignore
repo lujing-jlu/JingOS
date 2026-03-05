@@ -1,3 +1,5 @@
 /target
 /.idea
 /.vscode
+/.cargo-local
+/.rustup-local
