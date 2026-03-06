@@ -1,0 +1,7 @@
+# verify auto scheduler steps once per interval tick
+tasks
+tasknew userdemo
+taskauto on 100
+sleep_s 4
+taskauto off
+exit

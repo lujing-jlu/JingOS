@@ -41,7 +41,7 @@ cargo run -- bios --show
 
 如果运行成功，QEMU 串口会输出内核日志并进入监视器输入窗口（约 8 秒），可输入命令：
 
-- `help` / `status` / `ticks` / `uptime` / `irq` / `mem` / `maps [n|all]` / `heap` / `vm [addr]` / `vmmap [addr]`（分页级别详情） / `fault [addr]` / `syscall <n> [a0] [a1] [a2]` / `sysabi` / `tasks` / `tasknew [userdemo|monitor|fastsyscall|fastsyscall_fail]` / `taskstep` / `taskrun [n]` / `tasksleep <id> [ticks]` / `userdemo` / `usermode` / `usermode_syscall` / `usermode_syscall_fail` / `echo` / `history` / `clear` / `exit`
+- `help` / `status` / `ticks` / `uptime` / `timerhz [hz]` / `irq` / `mem` / `maps [n|all]` / `heap` / `vm [addr]` / `vmmap [addr]`（分页级别详情） / `fault [addr]` / `syscall <n> [a0] [a1] [a2]` / `sysabi` / `tasks` / `tasknew [userdemo|monitor|fastsyscall|fastsyscall_fail]` / `taskstep` / `taskrun [n]` / `tasksleep <id> [ticks]` / `taskwake <id>` / `taskrm <id>` / `taskprio <id> <priority>` / `taskauto [on [ticks]|off]` / `userdemo` / `usermode` / `usermode_syscall` / `usermode_syscall_fail` / `echo` / `history` / `clear` / `exit`
 
 监视器在有键盘输入时会自动续时；按 `Esc` 或输入 `exit` 可提前退出。
 
@@ -73,6 +73,36 @@ cargo run -- bios --serial-script ./scripts/scheduler-taskrun-demo.txt
 
 ```bash
 cargo run -- bios --serial-script ./scripts/scheduler-sleep-demo.txt
+```
+
+验证自动按 tick 推进调度器：
+
+```bash
+cargo run -- bios --serial-script ./scripts/scheduler-auto-demo.txt
+```
+
+验证手动唤醒睡眠任务：
+
+```bash
+cargo run -- bios --serial-script ./scripts/scheduler-wake-demo.txt
+```
+
+验证移除任务并更新调度表：
+
+```bash
+cargo run -- bios --serial-script ./scripts/scheduler-remove-demo.txt
+```
+
+验证优先级调度：
+
+```bash
+cargo run -- bios --serial-script ./scripts/scheduler-priority-demo.txt
+```
+
+验证 PIT 频率查询与更新：
+
+```bash
+cargo run -- bios --serial-script ./scripts/timerhz-demo.txt
 ```
 
 验证调度器驱动 fast syscall 成功路径：
@@ -180,7 +210,7 @@ CI 自动回归（GitHub Actions）：
 
 - 串口日志输出（`uart_16550`）
 - FrameBuffer 文本输出（内核 `print!` / `println!`）
-- 中断系统已接入（`IDT + PIC + PIT`，可观测时钟 tick）
+- 中断系统已接入（`IDT + PIC + PIT`，可观测时钟 tick，支持运行时查询/调整 PIT 频率）
 - 已接入键盘 IRQ1 读取 + scancode 解码（字符、方向键、Esc、F1-F12、Insert/Delete/Home/End/Page）
 - 已加入内存地图统计与 4KiB 页帧分配器起步骨架（基于 BootInfo memory map）
 - 已启用物理内存映射偏移（`physical_memory_offset`），为后续页表操作准备
@@ -189,7 +219,7 @@ CI 自动回归（GitHub Actions）：
 - 已接入页错误异常处理（Page Fault handler）
 - 已提供最小监视器命令行（串口+FrameBuffer 同步回显）
 - 已接入 int 0x80 syscall 分发层（寄存器 ABI：`rax/rdi/rsi/rdx` 入参，`rax/rcx` 出参）与 userdemo 用户态雏形命令
-- 已加入任务调度器雏形（task table + `tasks/tasknew/taskstep/taskrun/tasksleep` 命令，支持一次执行多个调度 step，并支持按 tick 休眠任务；`user_demo` 任务可在调度时真实执行）
+- 已加入任务调度器雏形（task table + `tasks/tasknew/taskstep/taskrun/tasksleep/taskwake/taskrm/taskprio/taskauto` 命令，支持一次执行多个调度 step、按 tick 休眠/唤醒、任务移除与自动按 tick 推进；`user_demo` 任务可在调度时真实执行）
 - 已接入 ring3 跳转探针（`usermode` / `usermode_syscall` / `usermode_syscall_fail` 命令，经 `int 0x81` 返回监视器；`usermode_syscall` 校验成功路径，`usermode_syscall_fail` 校验 unknown/overflow 错误路径的 `rax(value)` + `r10(status)`）
 - 已加入 `syscall/sysret` 预研骨架（CPU SYSCALL 能力探测 + STAR/LSTAR/SFMASK 预写入 + selector/GS 基址规划，SCE 实验性启用）
 - BIOS/UEFI 双启动路径

@@ -1,6 +1,7 @@
 use spin::Mutex;
 
 pub const MAX_TASKS: usize = 8;
+pub const DEFAULT_TASK_PRIORITY: u8 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
@@ -23,6 +24,7 @@ pub struct TaskInfo {
     pub kind: TaskKind,
     pub state: TaskState,
     pub run_count: u64,
+    pub priority: u8,
     pub sleep_until_tick: Option<u64>,
 }
 
@@ -69,6 +71,7 @@ impl TaskTable {
             kind: TaskKind::KernelMonitor,
             state: TaskState::Ready,
             run_count: 0,
+            priority: DEFAULT_TASK_PRIORITY,
             sleep_until_tick: None,
         });
         self.next_id = self.next_id.max(2);
@@ -86,6 +89,7 @@ impl TaskTable {
             kind,
             state: TaskState::Ready,
             run_count: 0,
+            priority: DEFAULT_TASK_PRIORITY,
             sleep_until_tick: None,
         });
         Ok(id)
@@ -119,10 +123,24 @@ impl TaskTable {
     fn step(&mut self, now_ticks: u64) -> Option<TaskStepReport> {
         self.wake_due(now_ticks);
 
+        let mut selected_priority: Option<u8> = None;
+        for task in self.slots.iter().flatten() {
+            if task.state != TaskState::Ready {
+                continue;
+            }
+
+            selected_priority = Some(match selected_priority {
+                Some(current_priority) => current_priority.max(task.priority),
+                None => task.priority,
+            });
+        }
+
+        let selected_priority = selected_priority?;
+
         let mut selected_index = None;
         for offset in 0..MAX_TASKS {
             let index = (self.next_rr_index + offset) % MAX_TASKS;
-            if matches!(self.slots[index], Some(task) if task.state == TaskState::Ready) {
+            if matches!(self.slots[index], Some(task) if task.state == TaskState::Ready && task.priority == selected_priority) {
                 selected_index = Some(index);
                 break;
             }
@@ -174,6 +192,90 @@ impl TaskTable {
             task.state = TaskState::Sleeping;
             task.sleep_until_tick = Some(until_tick);
             return Ok(until_tick);
+        }
+
+        Err("task not found")
+    }
+
+    fn wake(&mut self, id: u64, now_ticks: u64) -> Result<TaskInfo, &'static str> {
+        self.wake_due(now_ticks);
+
+        for slot in self.slots.iter_mut() {
+            let Some(task) = slot.as_mut() else {
+                continue;
+            };
+
+            if task.id != id {
+                continue;
+            }
+
+            if task.state == TaskState::Running {
+                return Err("task is running");
+            }
+
+            if task.state != TaskState::Sleeping {
+                return Err("task is not sleeping");
+            }
+
+            task.state = TaskState::Ready;
+            task.sleep_until_tick = None;
+            return Ok(*task);
+        }
+
+        Err("task not found")
+    }
+
+    fn remove(&mut self, id: u64, now_ticks: u64) -> Result<TaskInfo, &'static str> {
+        self.wake_due(now_ticks);
+
+        if id == 1 {
+            return Err("cannot remove bootstrap task");
+        }
+
+        for slot in self.slots.iter_mut() {
+            let Some(task) = slot.as_ref() else {
+                continue;
+            };
+
+            if task.id != id {
+                continue;
+            }
+
+            if task.state == TaskState::Running {
+                return Err("task is running");
+            }
+
+            let removed = *task;
+            *slot = None;
+            return Ok(removed);
+        }
+
+        Err("task not found")
+    }
+
+    fn set_priority(
+        &mut self,
+        id: u64,
+        priority: u8,
+        now_ticks: u64,
+    ) -> Result<TaskInfo, &'static str> {
+        self.wake_due(now_ticks);
+
+        for slot in self.slots.iter_mut() {
+            let Some(task) = slot.as_mut() else {
+                continue;
+            };
+
+            if task.id != id {
+                continue;
+            }
+
+            if task.state == TaskState::Running {
+                return Err("task is running");
+            }
+
+            task.priority = priority;
+            return Ok(*task);
         }
 
         Err("task not found")
@@ -235,6 +337,21 @@ pub fn step(now_ticks: u64) -> Option<TaskStepReport> {
 pub fn sleep(id: u64, sleep_ticks: u64, now_ticks: u64) -> Result<u64, &'static str> {
     let mut table = TASK_TABLE.lock();
     table.sleep(id, sleep_ticks, now_ticks)
+}
+
+pub fn wake(id: u64, now_ticks: u64) -> Result<TaskInfo, &'static str> {
+    let mut table = TASK_TABLE.lock();
+    table.wake(id, now_ticks)
+}
+
+pub fn remove(id: u64, now_ticks: u64) -> Result<TaskInfo, &'static str> {
+    let mut table = TASK_TABLE.lock();
+    table.remove(id, now_ticks)
+}
+
+pub fn set_priority(id: u64, priority: u8, now_ticks: u64) -> Result<TaskInfo, &'static str> {
+    let mut table = TASK_TABLE.lock();
+    table.set_priority(id, priority, now_ticks)
 }
 
 pub fn snapshot() -> SchedulerSnapshot {

@@ -1,0 +1,6 @@
+# verify waking a sleeping task makes it runnable again
+tasknew userdemo
+tasksleep 2 400
+taskwake 2
+taskrun 2
+exit

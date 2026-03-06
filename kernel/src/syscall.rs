@@ -13,7 +13,6 @@ use crate::memory;
 
 pub const SYSCALL_INTERRUPT_VECTOR: u8 = 0x80;
 
-pub const TICKS_PER_SECOND: u64 = 100;
 pub const SYSCALL_GET_TICKS: u64 = 0;
 pub const SYSCALL_GET_UPTIME_SECONDS: u64 = 1;
 pub const SYSCALL_ADD: u64 = 2;
@@ -275,7 +274,7 @@ pub enum SyscallError {
 pub fn dispatch(number: u64, arg0: u64, arg1: u64, _arg2: u64) -> Result<u64, SyscallError> {
     match number {
         SYSCALL_GET_TICKS => Ok(crate::interrupts::ticks()),
-        SYSCALL_GET_UPTIME_SECONDS => Ok(crate::interrupts::ticks() / TICKS_PER_SECOND),
+        SYSCALL_GET_UPTIME_SECONDS => Ok(crate::interrupts::ticks() / crate::interrupts::pit_hz() as u64),
         SYSCALL_ADD => arg0.checked_add(arg1).ok_or(SyscallError::Overflow),
         SYSCALL_GET_USABLE_MEMORY => {
             let Some(summary) = memory::kernel_memory_summary() else {

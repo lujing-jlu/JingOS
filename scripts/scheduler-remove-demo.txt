@@ -1,0 +1,5 @@
+# verify removing a task updates scheduler table
+tasknew monitor
+taskrm 2
+tasks
+exit

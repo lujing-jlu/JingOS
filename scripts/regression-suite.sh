@@ -86,6 +86,41 @@ run_fast_suite() {
     "taskstep: ran id=2 kind=user_demo runs=1"
 
   run_case \
+    "scheduler_auto" \
+    "scripts/scheduler-auto-demo.txt" \
+    "taskauto: enabled interval_ticks=100" \
+    "taskauto: ran id=" \
+    "user_demo result: ticks=" \
+    "taskauto: disabled"
+
+  run_case \
+    "scheduler_wake" \
+    "scripts/scheduler-wake-demo.txt" \
+    "tasksleep: id=2 sleep_ticks=400" \
+    "taskwake: id=2 kind=user_demo state=ready" \
+    "taskrun: requested=2 executed=2" \
+    "user_demo result: ticks="
+
+  run_case \
+    "scheduler_remove" \
+    "scripts/scheduler-remove-demo.txt" \
+    "taskrm: removed id=2 kind=kernel_monitor state=ready runs=0" \
+    "scheduler: total=1 ready=1 running=0 sleeping=0 finished=0 capacity=8 next_id=3"
+
+  run_case \
+    "scheduler_priority" \
+    "scripts/scheduler-priority-demo.txt" \
+    "taskprio: id=3 priority=20" \
+    "taskstep: ran id=3 kind=user_demo runs=1"
+
+  run_case \
+    "timerhz_demo" \
+    "scripts/timerhz-demo.txt" \
+    "timerhz: current_hz=100" \
+    "timerhz: old_hz=100 new_hz=200" \
+    "timerhz: current_hz=200"
+
+  run_case \
     "usermode_return" \
     "scripts/usermode-return-demo.txt" \
     "returned from ring3 via int 0x81; resuming monitor"

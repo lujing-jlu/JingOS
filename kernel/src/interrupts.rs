@@ -1,6 +1,6 @@
 use core::arch::global_asm;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use pic8259::ChainedPics;
 use spin::{Lazy, Mutex};
@@ -215,6 +215,7 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
 });
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
+static CURRENT_PIT_HZ: AtomicU32 = AtomicU32::new(100);
 static KEYBOARD_IRQS: AtomicU64 = AtomicU64::new(0);
 const SCANCODE_BUFFER_SIZE: usize = 128;
 static SCANCODE_BUFFER: Mutex<ScancodeBuffer> = Mutex::new(ScancodeBuffer::new());
@@ -304,12 +305,22 @@ pub fn init() {
         pics.write_masks(0b1111_1100, 0b1111_1111);
     });
 
-    program_pit(100);
+    set_pit_hz(100);
     x86_64::instructions::interrupts::enable();
 }
 
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
+}
+
+pub fn pit_hz() -> u32 {
+    CURRENT_PIT_HZ.load(Ordering::Relaxed)
+}
+
+pub fn set_pit_hz(requested_hz: u32) -> u32 {
+    let programmed_hz = x86_64::instructions::interrupts::without_interrupts(|| program_pit(requested_hz));
+    CURRENT_PIT_HZ.store(programmed_hz, Ordering::Relaxed);
+    programmed_hz
 }
 
 pub fn pop_scancode() -> Option<u8> {
@@ -323,9 +334,10 @@ pub fn keyboard_counters() -> (u64, u64) {
     (count, dropped)
 }
 
-fn program_pit(requested_hz: u32) {
+fn program_pit(requested_hz: u32) -> u32 {
     let hz = requested_hz.clamp(PIT_MIN_HZ, PIT_MAX_HZ);
     let divisor = (PIT_INPUT_HZ / hz).clamp(1, u16::MAX as u32) as u16;
+    let programmed_hz = (PIT_INPUT_HZ / divisor as u32).clamp(PIT_MIN_HZ, PIT_MAX_HZ);
 
     unsafe {
         let mut command: Port<u8> = Port::new(PIT_COMMAND_PORT);
@@ -335,6 +347,8 @@ fn program_pit(requested_hz: u32) {
         channel0.write((divisor & 0x00ff) as u8);
         channel0.write((divisor >> 8) as u8);
     }
+
+    programmed_hz
 }
 
 extern "x86-interrupt" fn breakpoint_handler(_stack_frame: InterruptStackFrame) {

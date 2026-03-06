@@ -1,0 +1,6 @@
+# verify higher-priority ready task is chosen first
+tasknew monitor
+tasknew userdemo
+taskprio 3 20
+taskstep
+exit

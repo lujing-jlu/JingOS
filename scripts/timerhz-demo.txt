@@ -1,0 +1,5 @@
+# verify PIT frequency can be queried and updated
+timerhz
+timerhz 200
+timerhz
+exit

@@ -363,11 +363,12 @@ const INPUT_LINE_MAX: usize = 128;
 const HISTORY_CAPACITY: usize = 16;
 const MONITOR_PROMPT: &str = "jingos> ";
 const MONITOR_READY_MARKER: &str = "[[JINGOS_MONITOR_READY]]";
-const COMMAND_NAMES: [&str; 27] = [
+const COMMAND_NAMES: [&str; 32] = [
     "help",
     "status",
     "ticks",
     "uptime",
+    "timerhz",
     "irq",
     "mem",
     "maps",
@@ -382,6 +383,10 @@ const COMMAND_NAMES: [&str; 27] = [
     "taskstep",
     "taskrun",
     "tasksleep",
+    "taskwake",
+    "taskrm",
+    "taskprio",
+    "taskauto",
     "userdemo",
     "usermode",
     "usermode_syscall",
@@ -777,6 +782,45 @@ impl CommandHistory {
     }
 }
 
+
+#[derive(Clone, Copy)]
+struct SchedulerAutoMode {
+    enabled: bool,
+    interval_ticks: u64,
+    next_run_tick: u64,
+}
+
+impl SchedulerAutoMode {
+    const DEFAULT_INTERVAL_TICKS: u64 = 100;
+
+    fn new(now_tick: u64) -> Self {
+        Self {
+            enabled: false,
+            interval_ticks: Self::DEFAULT_INTERVAL_TICKS,
+            next_run_tick: now_tick,
+        }
+    }
+
+    fn enable(&mut self, interval_ticks: u64, now_tick: u64) {
+        self.enabled = true;
+        self.interval_ticks = interval_ticks;
+        self.next_run_tick = now_tick.saturating_add(interval_ticks);
+    }
+
+    fn disable(&mut self) {
+        self.enabled = false;
+    }
+
+    fn maybe_run(&mut self, port: &mut uart_16550::SerialPort, now_tick: u64) {
+        if !self.enabled || now_tick < self.next_run_tick {
+            return;
+        }
+
+        self.next_run_tick = now_tick.saturating_add(self.interval_ticks);
+        let _ = run_task_step_with_label_internal(port, "taskauto", false);
+    }
+}
+
 fn input_loop(
     port: &mut uart_16550::SerialPort,
     memory_regions: &'static MemoryRegions,
@@ -793,6 +837,7 @@ fn input_loop(
     let mut history = CommandHistory::new();
     let mut rendered_len = MONITOR_PROMPT.len();
     let mut overwrite_mode = false;
+    let mut auto_scheduler = SchedulerAutoMode::new(start_ticks);
 
     console_println!(port);
     console_println!(port, "{MONITOR_READY_MARKER}");
@@ -815,6 +860,7 @@ fn input_loop(
                     memory_regions,
                     memory_summary,
                     physical_memory_offset,
+                    &mut auto_scheduler,
                 ) {
                     let (keyboard_irqs, dropped) = interrupts::keyboard_counters();
                     console_println!(
@@ -841,6 +887,7 @@ fn input_loop(
                     memory_regions,
                     memory_summary,
                     physical_memory_offset,
+                    &mut auto_scheduler,
                 ) {
                     let (keyboard_irqs, dropped) = interrupts::keyboard_counters();
                     console_println!(
@@ -852,7 +899,10 @@ fn input_loop(
             }
         }
 
-        if interrupts::ticks() >= deadline {
+        let now_tick = interrupts::ticks();
+        auto_scheduler.maybe_run(port, now_tick);
+
+        if now_tick >= deadline {
             let (keyboard_irqs, dropped) = interrupts::keyboard_counters();
             console_println!(
                 port,
@@ -876,6 +926,7 @@ fn handle_key_event(
     memory_regions: &'static MemoryRegions,
     memory_summary: memory::MemorySummary,
     physical_memory_offset: Option<u64>,
+    auto_scheduler: &mut SchedulerAutoMode,
 ) -> bool {
     match event {
         KeyEvent::Char(character) => {
@@ -909,6 +960,7 @@ fn handle_key_event(
                 memory_summary,
                 physical_memory_offset,
                 history,
+                auto_scheduler,
             );
             line.clear();
             history.reset_browsing();
@@ -1091,7 +1143,11 @@ fn run_task_payload(port: &mut uart_16550::SerialPort, kind: task::TaskKind) {
     }
 }
 
-fn run_task_step_with_label(port: &mut uart_16550::SerialPort, label: &str) -> bool {
+fn run_task_step_with_label_internal(
+    port: &mut uart_16550::SerialPort,
+    label: &str,
+    print_no_ready: bool,
+) -> bool {
     match task::step(interrupts::ticks()) {
         Some(report) => {
             console_println!(
@@ -1105,10 +1161,16 @@ fn run_task_step_with_label(port: &mut uart_16550::SerialPort, label: &str) -> b
             true
         }
         None => {
-            console_println!(port, "{label}: no ready task");
+            if print_no_ready {
+                console_println!(port, "{label}: no ready task");
+            }
             false
         }
     }
+}
+
+fn run_task_step_with_label(port: &mut uart_16550::SerialPort, label: &str) -> bool {
+    run_task_step_with_label_internal(port, label, true)
 }
 
 fn execute_command(
@@ -1118,6 +1180,7 @@ fn execute_command(
     memory_summary: memory::MemorySummary,
     physical_memory_offset: Option<u64>,
     history: &CommandHistory,
+    auto_scheduler: &mut SchedulerAutoMode,
 ) -> bool {
     let mut parts = command_line.split_whitespace();
     let Some(command) = parts.next() else {
@@ -1128,7 +1191,7 @@ fn execute_command(
         "help" => {
             console_println!(
                 port,
-                "commands: help, status, ticks, uptime, irq, mem, maps [n|all], heap, vm [addr], vmmap [addr], fault [addr], syscall <n> [a0] [a1] [a2], sysabi, tasks, tasknew [userdemo|monitor|fastsyscall|fastsyscall_fail], taskstep, taskrun [n], tasksleep <id> [ticks], userdemo, usermode, usermode_syscall, usermode_syscall_fail, echo, history, clear, exit"
+                "commands: help, status, ticks, uptime, timerhz [hz], irq, mem, maps [n|all], heap, vm [addr], vmmap [addr], fault [addr], syscall <n> [a0] [a1] [a2], sysabi, tasks, tasknew [userdemo|monitor|fastsyscall|fastsyscall_fail], taskstep, taskrun [n], tasksleep <id> [ticks], taskwake <id>, taskrm <id>, taskprio <id> <priority>, taskauto [on [ticks]|off], userdemo, usermode, usermode_syscall, usermode_syscall_fail, echo, history, clear, exit"
             );
         }
         "status" => {
@@ -1147,14 +1210,32 @@ fn execute_command(
         }
         "uptime" => {
             let ticks = interrupts::ticks();
-            let seconds = ticks / 100;
-            let centiseconds = ticks % 100;
+            let pit_hz = interrupts::pit_hz() as u64;
+            let seconds = ticks / pit_hz;
+            let centiseconds = ((ticks % pit_hz) * 100) / pit_hz;
             console_println!(
                 port,
-                "uptime={}s.{:02} (ticks={ticks})",
+                "uptime={}s.{:02} (ticks={ticks}, hz={})",
                 seconds,
-                centiseconds
+                centiseconds,
+                pit_hz
             );
+        }
+        "timerhz" => {
+            match parts.next() {
+                None => {
+                    console_println!(port, "timerhz: current_hz={}", interrupts::pit_hz());
+                }
+                Some(raw_hz) => {
+                    let Some(requested_hz_raw) = parse_u64(raw_hz) else {
+                        console_println!(port, "timerhz usage: timerhz [hz] (got: {raw_hz})");
+                        return false;
+                    };
+                    let old_hz = interrupts::pit_hz();
+                    let new_hz = interrupts::set_pit_hz(requested_hz_raw.min(u32::MAX as u64) as u32);
+                    console_println!(port, "timerhz: old_hz={} new_hz={}", old_hz, new_hz);
+                }
+            }
         }
         "irq" => {
             let (keyboard_irqs, dropped) = interrupts::keyboard_counters();
@@ -1434,21 +1515,23 @@ fn execute_command(
                     if let Some(until_tick) = entry.sleep_until_tick {
                         console_println!(
                             port,
-                            "  task id={} kind={} state={} runs={} sleep_until_tick={}",
+                            "  task id={} kind={} state={} runs={} priority={} sleep_until_tick={}",
                             entry.id,
                             task::task_kind_name(entry.kind),
                             task::task_state_name(entry.state),
                             entry.run_count,
+                            entry.priority,
                             until_tick
                         );
                     } else {
                         console_println!(
                             port,
-                            "  task id={} kind={} state={} runs={}",
+                            "  task id={} kind={} state={} runs={} priority={}",
                             entry.id,
                             task::task_kind_name(entry.kind),
                             task::task_state_name(entry.state),
-                            entry.run_count
+                            entry.run_count,
+                            entry.priority
                         );
                     }
                 }
@@ -1558,6 +1641,153 @@ fn execute_command(
                 }
                 Err(error) => {
                     console_println!(port, "tasksleep failed: {error}");
+                }
+            }
+        }
+        "taskwake" => {
+            let Some(raw_task_id) = parts.next() else {
+                console_println!(port, "taskwake usage: taskwake <id>");
+                return false;
+            };
+
+            let Some(task_id) = parse_u64(raw_task_id) else {
+                console_println!(port, "taskwake usage: taskwake <id> (got id={raw_task_id})");
+                return false;
+            };
+
+            match task::wake(task_id, interrupts::ticks()) {
+                Ok(task_info) => {
+                    console_println!(
+                        port,
+                        "taskwake: id={} kind={} state={} runs={}",
+                        task_info.id,
+                        task::task_kind_name(task_info.kind),
+                        task::task_state_name(task_info.state),
+                        task_info.run_count
+                    );
+                }
+                Err(error) => {
+                    console_println!(port, "taskwake failed: {error}");
+                }
+            }
+        }
+        "taskrm" => {
+            let Some(raw_task_id) = parts.next() else {
+                console_println!(port, "taskrm usage: taskrm <id>");
+                return false;
+            };
+
+            let Some(task_id) = parse_u64(raw_task_id) else {
+                console_println!(port, "taskrm usage: taskrm <id> (got id={raw_task_id})");
+                return false;
+            };
+
+            match task::remove(task_id, interrupts::ticks()) {
+                Ok(task_info) => {
+                    console_println!(
+                        port,
+                        "taskrm: removed id={} kind={} state={} runs={}",
+                        task_info.id,
+                        task::task_kind_name(task_info.kind),
+                        task::task_state_name(task_info.state),
+                        task_info.run_count
+                    );
+                }
+                Err(error) => {
+                    console_println!(port, "taskrm failed: {error}");
+                }
+            }
+        }
+        "taskprio" => {
+            let Some(raw_task_id) = parts.next() else {
+                console_println!(port, "taskprio usage: taskprio <id> <priority>");
+                return false;
+            };
+
+            let Some(task_id) = parse_u64(raw_task_id) else {
+                console_println!(port, "taskprio usage: taskprio <id> <priority> (got id={raw_task_id})");
+                return false;
+            };
+
+            let Some(raw_priority) = parts.next() else {
+                console_println!(port, "taskprio usage: taskprio <id> <priority>");
+                return false;
+            };
+
+            let Some(priority_raw) = parse_u64(raw_priority) else {
+                console_println!(port, "taskprio usage: taskprio <id> <priority> (got priority={raw_priority})");
+                return false;
+            };
+
+            let priority = priority_raw.min(u8::MAX as u64) as u8;
+            match task::set_priority(task_id, priority, interrupts::ticks()) {
+                Ok(task_info) => {
+                    console_println!(
+                        port,
+                        "taskprio: id={} priority={} kind={} state={}",
+                        task_info.id,
+                        task_info.priority,
+                        task::task_kind_name(task_info.kind),
+                        task::task_state_name(task_info.state)
+                    );
+                }
+                Err(error) => {
+                    console_println!(port, "taskprio failed: {error}");
+                }
+            }
+        }
+        "taskauto" => {
+            let now_tick = interrupts::ticks();
+
+            match parts.next() {
+                None => {
+                    console_println!(
+                        port,
+                        "taskauto: enabled={} interval_ticks={} next_run_tick={} now_tick={}",
+                        auto_scheduler.enabled,
+                        auto_scheduler.interval_ticks,
+                        auto_scheduler.next_run_tick,
+                        now_tick
+                    );
+                }
+                Some("off") => {
+                    auto_scheduler.disable();
+                    console_println!(port, "taskauto: disabled");
+                }
+                Some("on") => {
+                    let interval_ticks = match parts.next() {
+                        None => SchedulerAutoMode::DEFAULT_INTERVAL_TICKS,
+                        Some(raw_interval) => {
+                            let Some(parsed) = parse_u64(raw_interval) else {
+                                console_println!(
+                                    port,
+                                    "taskauto usage: taskauto [on [ticks]|off] (got ticks={raw_interval})"
+                                );
+                                return false;
+                            };
+                            if parsed == 0 {
+                                console_println!(port, "taskauto ticks must be > 0");
+                                return false;
+                            }
+                            parsed
+                        }
+                    };
+
+                    auto_scheduler.enable(interval_ticks, now_tick);
+                    console_println!(
+                        port,
+                        "taskauto: enabled interval_ticks={} next_run_tick={} now_tick={}",
+                        auto_scheduler.interval_ticks,
+                        auto_scheduler.next_run_tick,
+                        now_tick
+                    );
+                }
+                Some(raw_mode) => {
+                    console_println!(
+                        port,
+                        "taskauto usage: taskauto [on [ticks]|off] (got: {raw_mode})"
+                    );
+                    return false;
                 }
             }
         }
