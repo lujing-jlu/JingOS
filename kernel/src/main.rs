@@ -363,7 +363,7 @@ const INPUT_LINE_MAX: usize = 128;
 const HISTORY_CAPACITY: usize = 16;
 const MONITOR_PROMPT: &str = "jingos> ";
 const MONITOR_READY_MARKER: &str = "[[JINGOS_MONITOR_READY]]";
-const COMMAND_NAMES: [&str; 25] = [
+const COMMAND_NAMES: [&str; 27] = [
     "help",
     "status",
     "ticks",
@@ -380,6 +380,8 @@ const COMMAND_NAMES: [&str; 25] = [
     "tasks",
     "tasknew",
     "taskstep",
+    "taskrun",
+    "tasksleep",
     "userdemo",
     "usermode",
     "usermode_syscall",
@@ -1039,6 +1041,76 @@ fn handle_key_event(
     }
 }
 
+fn run_task_payload(port: &mut uart_16550::SerialPort, kind: task::TaskKind) {
+    match kind {
+        task::TaskKind::UserDemo => match user_program::run_user_demo() {
+            Ok(result) => {
+                console_println!(
+                    port,
+                    "  user_demo result: ticks={} uptime={}s sum={} usable_bytes={} usable_frames={}",
+                    result.ticks,
+                    result.uptime_seconds,
+                    result.sum,
+                    result.usable_bytes,
+                    result.usable_frames
+                );
+            }
+            Err(error) => {
+                console_println!(port, "  user_demo task failed: {}", syscall::error_name(error));
+            }
+        },
+        task::TaskKind::FastSyscallSuccess => {
+            console_println!(
+                port,
+                "  fast_syscall_success task: entering ring3 success-path syscall demo"
+            );
+            match usermode::run_fast_syscall_demo() {
+                Ok(()) => {
+                    console_println!(port, "  fast_syscall_success returned unexpectedly");
+                }
+                Err(error) => {
+                    console_println!(port, "  fast_syscall_success task failed: {error}");
+                }
+            }
+        }
+        task::TaskKind::FastSyscallError => {
+            console_println!(
+                port,
+                "  fast_syscall_error task: entering ring3 error-path syscall demo"
+            );
+            match usermode::run_fast_syscall_error_demo() {
+                Ok(()) => {
+                    console_println!(port, "  fast_syscall_error returned unexpectedly");
+                }
+                Err(error) => {
+                    console_println!(port, "  fast_syscall_error task failed: {error}");
+                }
+            }
+        }
+        task::TaskKind::KernelMonitor => {}
+    }
+}
+
+fn run_task_step_with_label(port: &mut uart_16550::SerialPort, label: &str) -> bool {
+    match task::step(interrupts::ticks()) {
+        Some(report) => {
+            console_println!(
+                port,
+                "{label}: ran id={} kind={} runs={} (state reset to ready)",
+                report.id,
+                task::task_kind_name(report.kind),
+                report.run_count
+            );
+            run_task_payload(port, report.kind);
+            true
+        }
+        None => {
+            console_println!(port, "{label}: no ready task");
+            false
+        }
+    }
+}
+
 fn execute_command(
     port: &mut uart_16550::SerialPort,
     command_line: &str,
@@ -1056,7 +1128,7 @@ fn execute_command(
         "help" => {
             console_println!(
                 port,
-                "commands: help, status, ticks, uptime, irq, mem, maps [n|all], heap, vm [addr], vmmap [addr], fault [addr], syscall <n> [a0] [a1] [a2], sysabi, tasks, tasknew [userdemo|monitor|fastsyscall|fastsyscall_fail], taskstep, userdemo, usermode, usermode_syscall, usermode_syscall_fail, echo, history, clear, exit"
+                "commands: help, status, ticks, uptime, irq, mem, maps [n|all], heap, vm [addr], vmmap [addr], fault [addr], syscall <n> [a0] [a1] [a2], sysabi, tasks, tasknew [userdemo|monitor|fastsyscall|fastsyscall_fail], taskstep, taskrun [n], tasksleep <id> [ticks], userdemo, usermode, usermode_syscall, usermode_syscall_fail, echo, history, clear, exit"
             );
         }
         "status" => {
@@ -1343,10 +1415,11 @@ fn execute_command(
             let snapshot = task::snapshot();
             console_println!(
                 port,
-                "scheduler: total={} ready={} running={} finished={} capacity={} next_id={}",
+                "scheduler: total={} ready={} running={} sleeping={} finished={} capacity={} next_id={}",
                 snapshot.total,
                 snapshot.ready,
                 snapshot.running,
+                snapshot.sleeping,
                 snapshot.finished,
                 snapshot.capacity,
                 snapshot.next_id
@@ -1358,14 +1431,26 @@ fn execute_command(
                 console_println!(port, "scheduler table is empty");
             } else {
                 for entry in entries.iter().take(count).flatten() {
-                    console_println!(
-                        port,
-                        "  task id={} kind={} state={} runs={}",
-                        entry.id,
-                        task::task_kind_name(entry.kind),
-                        task::task_state_name(entry.state),
-                        entry.run_count
-                    );
+                    if let Some(until_tick) = entry.sleep_until_tick {
+                        console_println!(
+                            port,
+                            "  task id={} kind={} state={} runs={} sleep_until_tick={}",
+                            entry.id,
+                            task::task_kind_name(entry.kind),
+                            task::task_state_name(entry.state),
+                            entry.run_count,
+                            until_tick
+                        );
+                    } else {
+                        console_println!(
+                            port,
+                            "  task id={} kind={} state={} runs={}",
+                            entry.id,
+                            task::task_kind_name(entry.kind),
+                            task::task_state_name(entry.state),
+                            entry.run_count
+                        );
+                    }
                 }
             }
         }
@@ -1393,81 +1478,89 @@ fn execute_command(
                 }
             }
         }
-        "taskstep" => match task::step() {
-            Some(report) => {
-                console_println!(
-                    port,
-                    "taskstep: ran id={} kind={} runs={} (state reset to ready)",
-                    report.id,
-                    task::task_kind_name(report.kind),
-                    report.run_count
-                );
+        "taskstep" => {
+            run_task_step_with_label(port, "taskstep");
+        }
+        "taskrun" => {
+            const DEFAULT_TASKRUN_STEPS: u64 = 4;
+            const MAX_TASKRUN_STEPS: u64 = 256;
 
-                match report.kind {
-                    task::TaskKind::UserDemo => match user_program::run_user_demo() {
-                        Ok(result) => {
-                            console_println!(
-                                port,
-                                "  user_demo result: ticks={} uptime={}s sum={} usable_bytes={} usable_frames={}",
-                                result.ticks,
-                                result.uptime_seconds,
-                                result.sum,
-                                result.usable_bytes,
-                                result.usable_frames
-                            );
-                        }
-                        Err(error) => {
-                            console_println!(
-                                port,
-                                "  user_demo task failed: {}",
-                                syscall::error_name(error)
-                            );
-                        }
-                    },
-                    task::TaskKind::FastSyscallSuccess => {
-                        console_println!(
-                            port,
-                            "  fast_syscall_success task: entering ring3 success-path syscall demo"
-                        );
-                        match usermode::run_fast_syscall_demo() {
-                            Ok(()) => {
-                                console_println!(
-                                    port,
-                                    "  fast_syscall_success returned unexpectedly"
-                                );
-                            }
-                            Err(error) => {
-                                console_println!(
-                                    port,
-                                    "  fast_syscall_success task failed: {error}"
-                                );
-                            }
-                        }
+            let steps_requested = match parts.next() {
+                None => DEFAULT_TASKRUN_STEPS,
+                Some(raw_steps) => {
+                    let Some(parsed) = parse_u64(raw_steps) else {
+                        console_println!(port, "taskrun usage: taskrun [steps] (got: {raw_steps})");
+                        return false;
+                    };
+                    if parsed == 0 {
+                        console_println!(port, "taskrun steps must be > 0");
+                        return false;
                     }
-                    task::TaskKind::FastSyscallError => {
-                        console_println!(
-                            port,
-                            "  fast_syscall_error task: entering ring3 error-path syscall demo"
-                        );
-                        match usermode::run_fast_syscall_error_demo() {
-                            Ok(()) => {
-                                console_println!(
-                                    port,
-                                    "  fast_syscall_error returned unexpectedly"
-                                );
-                            }
-                            Err(error) => {
-                                console_println!(port, "  fast_syscall_error task failed: {error}");
-                            }
-                        }
-                    }
-                    task::TaskKind::KernelMonitor => {}
+                    parsed.min(MAX_TASKRUN_STEPS)
+                }
+            };
+
+            let mut executed = 0_u64;
+            for _ in 0..steps_requested {
+                if run_task_step_with_label(port, "taskrun") {
+                    executed = executed.saturating_add(1);
+                } else {
+                    break;
                 }
             }
-            None => {
-                console_println!(port, "taskstep: no ready task");
+
+            console_println!(
+                port,
+                "taskrun: requested={} executed={}",
+                steps_requested,
+                executed
+            );
+        }
+        "tasksleep" => {
+            const DEFAULT_TASKSLEEP_TICKS: u64 = 100;
+
+            let Some(raw_task_id) = parts.next() else {
+                console_println!(port, "tasksleep usage: tasksleep <id> [ticks]");
+                return false;
+            };
+
+            let Some(task_id) = parse_u64(raw_task_id) else {
+                console_println!(port, "tasksleep usage: tasksleep <id> [ticks] (got id={raw_task_id})");
+                return false;
+            };
+
+            let sleep_ticks = match parts.next() {
+                None => DEFAULT_TASKSLEEP_TICKS,
+                Some(raw_ticks) => {
+                    let Some(parsed) = parse_u64(raw_ticks) else {
+                        console_println!(port, "tasksleep usage: tasksleep <id> [ticks] (got ticks={raw_ticks})");
+                        return false;
+                    };
+                    if parsed == 0 {
+                        console_println!(port, "tasksleep ticks must be > 0");
+                        return false;
+                    }
+                    parsed
+                }
+            };
+
+            let now_tick = interrupts::ticks();
+            match task::sleep(task_id, sleep_ticks, now_tick) {
+                Ok(until_tick) => {
+                    console_println!(
+                        port,
+                        "tasksleep: id={} sleep_ticks={} now_tick={} until_tick={}",
+                        task_id,
+                        sleep_ticks,
+                        now_tick,
+                        until_tick
+                    );
+                }
+                Err(error) => {
+                    console_println!(port, "tasksleep failed: {error}");
+                }
             }
-        },
+        }
         "userdemo" => match user_program::run_user_demo() {
             Ok(report) => {
                 console_println!(

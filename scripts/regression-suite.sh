@@ -72,6 +72,20 @@ run_fast_suite() {
     "taskstep: ran id=2 kind=user_demo runs=1"
 
   run_case \
+    "scheduler_taskrun" \
+    "scripts/scheduler-taskrun-demo.txt" \
+    "taskrun: ran id=" \
+    "taskrun: requested=3 executed=3" \
+    "user_demo result: ticks="
+
+  run_case \
+    "scheduler_sleep" \
+    "scripts/scheduler-sleep-demo.txt" \
+    "tasksleep: id=2 sleep_ticks=200" \
+    "taskrun: requested=2 executed=2" \
+    "taskstep: ran id=2 kind=user_demo runs=1"
+
+  run_case \
     "usermode_return" \
     "scripts/usermode-return-demo.txt" \
     "returned from ring3 via int 0x81; resuming monitor"

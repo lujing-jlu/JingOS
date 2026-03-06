@@ -1,0 +1,8 @@
+# verify sleeping task wakes by tick and gets scheduled afterwards
+tasks
+tasknew userdemo
+tasksleep 2 200
+taskrun 2
+sleep_s 3
+taskstep
+exit

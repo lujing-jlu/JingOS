@@ -1,0 +1,5 @@
+tasks
+tasknew userdemo
+tasknew monitor
+taskrun 3
+exit

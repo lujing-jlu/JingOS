@@ -6,6 +6,7 @@ pub const MAX_TASKS: usize = 8;
 pub enum TaskState {
     Ready,
     Running,
+    Sleeping,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +23,7 @@ pub struct TaskInfo {
     pub kind: TaskKind,
     pub state: TaskState,
     pub run_count: u64,
+    pub sleep_until_tick: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -29,6 +31,7 @@ pub struct SchedulerSnapshot {
     pub total: usize,
     pub ready: usize,
     pub running: usize,
+    pub sleeping: usize,
     pub finished: usize,
     pub capacity: usize,
     pub next_id: u64,
@@ -66,6 +69,7 @@ impl TaskTable {
             kind: TaskKind::KernelMonitor,
             state: TaskState::Ready,
             run_count: 0,
+            sleep_until_tick: None,
         });
         self.next_id = self.next_id.max(2);
     }
@@ -82,11 +86,39 @@ impl TaskTable {
             kind,
             state: TaskState::Ready,
             run_count: 0,
+            sleep_until_tick: None,
         });
         Ok(id)
     }
 
-    fn step(&mut self) -> Option<TaskStepReport> {
+    fn wake_due(&mut self, now_ticks: u64) -> usize {
+        let mut woke = 0_usize;
+
+        for slot in self.slots.iter_mut() {
+            let Some(task) = slot.as_mut() else {
+                continue;
+            };
+
+            if task.state != TaskState::Sleeping {
+                continue;
+            }
+
+            if task
+                .sleep_until_tick
+                .is_some_and(|until_tick| now_ticks >= until_tick)
+            {
+                task.state = TaskState::Ready;
+                task.sleep_until_tick = None;
+                woke = woke.saturating_add(1);
+            }
+        }
+
+        woke
+    }
+
+    fn step(&mut self, now_ticks: u64) -> Option<TaskStepReport> {
+        self.wake_due(now_ticks);
+
         let mut selected_index = None;
         for offset in 0..MAX_TASKS {
             let index = (self.next_rr_index + offset) % MAX_TASKS;
@@ -102,6 +134,7 @@ impl TaskTable {
         let mut task = self.slots[index]?;
         task.state = TaskState::Running;
         task.run_count = task.run_count.saturating_add(1);
+        task.sleep_until_tick = None;
         self.slots[index] = Some(task);
 
         let report = TaskStepReport {
@@ -111,21 +144,53 @@ impl TaskTable {
         };
 
         task.state = TaskState::Ready;
+        task.sleep_until_tick = None;
         self.slots[index] = Some(task);
 
         Some(report)
+    }
+
+    fn sleep(&mut self, id: u64, sleep_ticks: u64, now_ticks: u64) -> Result<u64, &'static str> {
+        if sleep_ticks == 0 {
+            return Err("sleep ticks must be > 0");
+        }
+
+        self.wake_due(now_ticks);
+
+        for slot in self.slots.iter_mut() {
+            let Some(task) = slot.as_mut() else {
+                continue;
+            };
+
+            if task.id != id {
+                continue;
+            }
+
+            if task.state == TaskState::Running {
+                return Err("task is running");
+            }
+
+            let until_tick = now_ticks.saturating_add(sleep_ticks);
+            task.state = TaskState::Sleeping;
+            task.sleep_until_tick = Some(until_tick);
+            return Ok(until_tick);
+        }
+
+        Err("task not found")
     }
 
     fn snapshot(&self) -> SchedulerSnapshot {
         let mut total = 0;
         let mut ready = 0;
         let mut running = 0;
+        let mut sleeping = 0;
 
         for task in self.slots.iter().flatten() {
             total += 1;
             match task.state {
                 TaskState::Ready => ready += 1,
                 TaskState::Running => running += 1,
+                TaskState::Sleeping => sleeping += 1,
             }
         }
 
@@ -133,6 +198,7 @@ impl TaskTable {
             total,
             ready,
             running,
+            sleeping,
             finished: 0,
             capacity: MAX_TASKS,
             next_id: self.next_id,
@@ -161,9 +227,14 @@ pub fn spawn(kind: TaskKind) -> Result<u64, &'static str> {
     table.spawn(kind)
 }
 
-pub fn step() -> Option<TaskStepReport> {
+pub fn step(now_ticks: u64) -> Option<TaskStepReport> {
     let mut table = TASK_TABLE.lock();
-    table.step()
+    table.step(now_ticks)
+}
+
+pub fn sleep(id: u64, sleep_ticks: u64, now_ticks: u64) -> Result<u64, &'static str> {
+    let mut table = TASK_TABLE.lock();
+    table.sleep(id, sleep_ticks, now_ticks)
 }
 
 pub fn snapshot() -> SchedulerSnapshot {
@@ -189,6 +260,7 @@ pub fn task_state_name(state: TaskState) -> &'static str {
     match state {
         TaskState::Ready => "ready",
         TaskState::Running => "running",
+        TaskState::Sleeping => "sleeping",
     }
 }
 
